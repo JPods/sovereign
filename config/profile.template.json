@@ -1,0 +1,108 @@
+{
+  "_note": "Copy this file to config/profile.json and fill in your details. Or run: python3 setup/profile_wizard.py --home .",
+
+  "profile": {
+    "name": "Your Name",
+    "mode": "unified",
+    "note": "unified = work and personal in one context. divided = strict separation.",
+    "created": "YYYY-MM-DD"
+  },
+
+  "monitoring": {
+    "projects": [
+      {
+        "id": "my-project",
+        "label": "My Project",
+        "path": "~/Documents/my-project",
+        "enabled": true,
+        "stagnation_alert_days": 5
+      }
+    ],
+    "apps": [
+      { "process": "Code",          "label": "VS Code",   "enabled": true },
+      { "process": "zoom.us",       "label": "Zoom",      "enabled": true },
+      { "process": "Google Chrome", "label": "Chrome",    "enabled": true }
+    ],
+    "harvest_lookback_days": 7
+  },
+
+  "priorities": [
+    {
+      "rank": 1,
+      "project": "my-project",
+      "goal": "Describe what you're trying to accomplish",
+      "deadline": null,
+      "status": "in-progress"
+    }
+  ],
+
+  "must_fix": [],
+
+  "standing_approvals": [
+    {
+      "class": "harvest-write",
+      "scope": "SOVEREIGN_HOME/today",
+      "granted": "YYYY-MM-DD",
+      "expires": null
+    },
+    {
+      "class": "log-append",
+      "scope": "SOVEREIGN_HOME/config/agent_log.jsonl",
+      "granted": "YYYY-MM-DD",
+      "expires": null
+    }
+  ],
+
+  "audit": {
+    "interval_hours": 24,
+    "note": "Sovereign will escalate in harvest.md if you skip beyond this interval.",
+    "ui_command": "python3 SOVEREIGN_HOME/scripts/audit.py",
+    "cli_command": "python3 SOVEREIGN_HOME/scripts/audit.py --cli"
+  },
+
+  "athena": {
+    "models": {
+      "triage": "athena-triage",
+      "deep":   "athena",
+      "reason": "athena-reason"
+    },
+    "review_script": "python3 SOVEREIGN_HOME/scripts/athena_review.py propose",
+    "noise_budget": {
+      "max_escalations_per_week": 5,
+      "note": "If Athena exceeds this, harvest.md flags a calibration problem."
+    },
+    "external_probes": {
+      "enabled": false,
+      "note": "Set enabled:true and configure providers. API keys from environment variables only.",
+      "auto_trigger": ["BLOCK", "model-disagreement", "probe-requested"],
+      "providers": [
+        {
+          "id": "openai",
+          "label": "OpenAI GPT-4o",
+          "endpoint": "https://api.openai.com/v1/chat/completions",
+          "model": "gpt-4o",
+          "api_key_env": "OPENAI_API_KEY",
+          "enabled": false
+        },
+        {
+          "id": "anthropic",
+          "label": "Anthropic Claude",
+          "endpoint": "https://api.anthropic.com/v1/messages",
+          "model": "claude-opus-4-5",
+          "api_key_env": "ANTHROPIC_API_KEY",
+          "enabled": false
+        }
+      ]
+    }
+  },
+
+  "assessment": {
+    "checks": [
+      { "id": "osl-resolution-rate", "enabled": true,  "description": "Flag unresolved must_fix items past deadline" },
+      { "id": "stagnation",          "enabled": true,  "description": "Alert when a project exceeds stagnation_alert_days" },
+      { "id": "priority-alignment",  "enabled": true,  "description": "Flag when activity doesn't match stated priorities" },
+      { "id": "cross-domain-debt",   "enabled": true,  "description": "Check cross-consequences when multiple domains active" },
+      { "id": "audit-overdue",       "enabled": true,  "description": "Escalate when pending-audit items exceed interval_hours" }
+    ]
+  }
+}
