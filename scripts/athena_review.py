@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-athena_review.py — Athena's multi-model review pipeline
+athena_review.py
+Athena's autonomous multi-model review pipeline.
 
-Routes proposed actions through three specialized LLMs:
-  1. athena-triage  (llama3.2 — fast, <5s)
-  2. athena         (gpt-oss:20b — deep security review)
-  3. athena-reason  (deepseek-r1:8b — adversarial threat modeling)
+Called by Allie when proposing an action. Runs three models in sequence:
+  1. athena-triage  (llama3.2 — fast classifier, <5s)
+  2. athena         (gpt-oss:20b — deep security review, called if REVIEW/REASON)
+  3. athena-reason  (deepseek-r1:8b — threat modeling, called if REASON domain)
 
-Per-model findings are stored separately in the queue item.
-External probes (OpenAI, Anthropic) triggered on BLOCK, disagreement, or explicit request.
+Writes one entry to /Volumes/Allie/config/agent_log.jsonl per review.
+Writes approved/flagged actions to /Volumes/Allie/config/action_queue.json.
 
 Usage:
-  python3 athena_review.py propose --action "..." --context "..." [--from allie] [--domain privacy] [--file path]
-  python3 athena_review.py status
-  python3 athena_review.py pending
-  python3 athena_review.py --home /path/to/sovereign ...
+  python3 athena_review.py propose --from allie --action "..." --context "..." [--domain privacy]
+  python3 athena_review.py propose --from allie --action "..." --context "..." --file /path/to/file.rb
+  python3 athena_review.py status          — show queue summary
+  python3 athena_review.py pending         — list items awaiting Bill's audit
+
+Allie's protocol: every proposed action MUST pass through this script before entering the queue.
+Nothing reaches Bill without Athena's review logged.
 """
 
 import sys
@@ -24,130 +28,48 @@ import datetime
 import subprocess
 import argparse
 import pathlib
-import os
-import urllib.request
 
+ALLIE = pathlib.Path("/Volumes/Allie")
+QUEUE_PATH = ALLIE / "config" / "action_queue.json"
+LOG_PATH = ALLIE / "config" / "agent_log.jsonl"
 
-def get_sovereign_home(args_home=None) -> pathlib.Path:
-    if args_home:
-        return pathlib.Path(args_home)
-    env = os.environ.get("SOVEREIGN_HOME")
-    if env:
-        return pathlib.Path(env)
-    for c in [pathlib.Path("/Volumes/Allie"), pathlib.Path.home() / "sovereign"]:
-        if (c / "config" / "profile.json").exists():
-            return c
-    print("ERROR: Cannot find Sovereign home. Set SOVEREIGN_HOME or use --home.")
-    sys.exit(1)
+# Model routing table
+MODELS = {
+    "triage": "athena-triage",
+    "deep":   "athena",
+    "reason": "athena-reason",
+}
 
-
-RISK_LEVELS = ["SAFE", "CAUTION", "ESCALATE", "BLOCK"]
+# Domains that always invoke athena-reason
 REASON_DOMAINS = {"privacy", "security", "code", "infrastructure"}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def load_profile(sovereign: pathlib.Path) -> dict:
-    path = sovereign / "config" / "profile.json"
-    return json.loads(path.read_text()) if path.exists() else {}
-
-
-def load_queue(sovereign: pathlib.Path) -> dict:
-    path = sovereign / "config" / "action_queue.json"
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return {"actions": []}
-
-
-def save_queue(sovereign: pathlib.Path, queue: dict):
-    (sovereign / "config" / "action_queue.json").write_text(json.dumps(queue, indent=2))
-
-
-def log_event(sovereign: pathlib.Path, entry: dict):
-    entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
-    with (sovereign / "config" / "agent_log.jsonl").open("a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-
-def is_standing_approved(sovereign: pathlib.Path, profile: dict, action: str, domain: str) -> bool:
-    """Check if this action class has a standing approval."""
-    for sa in profile.get("standing_approvals", []):
-        if not sa.get("expires") or datetime.date.fromisoformat(sa["expires"]) >= datetime.date.today():
-            if sa["class"] in action.lower() or sa["class"] in domain:
-                return True
-    return False
-
-
-# ── Model calls ───────────────────────────────────────────────────────────────
+# ── Ollama calls ──────────────────────────────────────────────────────────────
 
 def call_ollama(model: str, prompt: str, timeout: int = 120) -> str:
+    """Call an Ollama model and return the response text."""
     try:
         result = subprocess.run(
             ["ollama", "run", model],
-            input=prompt, capture_output=True, text=True, timeout=timeout
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
-        return result.stdout.strip() if result.returncode == 0 else f"ERROR: {result.stderr.strip()}"
+        if result.returncode != 0:
+            return f"ERROR: {result.stderr.strip()}"
+        return result.stdout.strip()
     except subprocess.TimeoutExpired:
         return f"ERROR: {model} timed out after {timeout}s"
     except FileNotFoundError:
-        return "ERROR: ollama not found"
+        return "ERROR: ollama not found in PATH"
 
 
-def call_external(provider: dict, prompt: str) -> str:
-    """Call an external LLM API (OpenAI or Anthropic format)."""
-    api_key = os.environ.get(provider["api_key_env"], "")
-    if not api_key:
-        return f"ERROR: {provider['api_key_env']} not set"
-
-    pid = provider["id"]
-    try:
-        if pid == "openai":
-            payload = json.dumps({
-                "model": provider["model"],
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1000,
-            }).encode()
-            req = urllib.request.Request(
-                provider["endpoint"],
-                data=payload,
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-                return data["choices"][0]["message"]["content"]
-
-        elif pid == "anthropic":
-            payload = json.dumps({
-                "model": provider["model"],
-                "max_tokens": 1000,
-                "messages": [{"role": "user", "content": prompt}],
-            }).encode()
-            req = urllib.request.Request(
-                provider["endpoint"],
-                data=payload,
-                headers={"x-api-key": api_key,
-                         "anthropic-version": "2023-06-01",
-                         "Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-                return data["content"][0]["text"]
-    except Exception as e:
-        return f"ERROR: {e}"
-    return "ERROR: unknown provider"
-
-
-# ── Parse model outputs ───────────────────────────────────────────────────────
+# ── Triage parse ──────────────────────────────────────────────────────────────
 
 def parse_triage(text: str) -> dict:
-    result = {"triage": "REVIEW", "domain": "routine", "flag": text,
-              "raw": text, "model": "athena-triage"}
+    """Extract TRIAGE, DOMAIN, FLAG from athena-triage response."""
+    result = {"triage": "REVIEW", "domain": "routine", "flag": text}
     for line in text.splitlines():
         if line.startswith("TRIAGE:"):
             result["triage"] = line.split(":", 1)[1].strip()
@@ -158,208 +80,193 @@ def parse_triage(text: str) -> dict:
     return result
 
 
-def parse_deep(text: str, model: str) -> dict:
-    result = {"risk": "CAUTION", "recommendation": "escalate-to-bill",
-              "conditions": "", "raw": text, "model": model,
-              "probe_requested": False}
+def parse_deep(text: str) -> dict:
+    """Extract RISK and RECOMMENDATION from athena / athena-reason response."""
+    result = {"risk": "CAUTION", "recommendation": "escalate-to-bill", "full_text": text}
     for line in text.splitlines():
         if line.startswith("RISK:"):
             result["risk"] = line.split(":", 1)[1].strip()
         elif line.startswith("RECOMMENDATION:"):
             result["recommendation"] = line.split(":", 1)[1].strip()
-        elif line.startswith("CONDITIONS:"):
-            result["conditions"] = line.split(":", 1)[1].strip()
-        elif line.startswith("PROBE:") and "YES" in line.upper():
-            result["probe_requested"] = True
     return result
 
 
-def worst_risk(risks: list) -> str:
-    return max(risks, key=lambda r: RISK_LEVELS.index(r) if r in RISK_LEVELS else 0)
+# ── Log ───────────────────────────────────────────────────────────────────────
+
+def log_event(entry: dict):
+    """Append one JSON line to agent_log.jsonl."""
+    entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
-def models_disagree(r1: str, r2: str) -> bool:
-    """True if models are 2+ levels apart."""
-    if r1 not in RISK_LEVELS or r2 not in RISK_LEVELS:
-        return False
-    return abs(RISK_LEVELS.index(r1) - RISK_LEVELS.index(r2)) >= 2
+# ── Queue ─────────────────────────────────────────────────────────────────────
+
+def load_queue() -> dict:
+    if QUEUE_PATH.exists():
+        try:
+            return json.loads(QUEUE_PATH.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"actions": []}
 
 
-# ── Main review pipeline ──────────────────────────────────────────────────────
+def save_queue(queue: dict):
+    QUEUE_PATH.write_text(json.dumps(queue, indent=2))
 
-def review(sovereign: pathlib.Path, profile: dict,
-           from_agent: str, action_text: str, context: str,
-           domain_hint: str = None, evidence_file: str = None) -> dict:
 
+def add_to_queue(item: dict):
+    queue = load_queue()
+    queue["actions"].append(item)
+    save_queue(queue)
+
+
+# ── Review pipeline ───────────────────────────────────────────────────────────
+
+def review(from_agent: str, action_text: str, context: str, domain_hint: str = None) -> dict:
+    """
+    Run the full Athena review pipeline.
+    Returns a queue item dict with review results embedded.
+    """
     action_id = str(uuid.uuid4())[:8]
     now = datetime.datetime.now().isoformat(timespec="seconds")
-    athena_cfg = profile.get("athena", {})
-    models = athena_cfg.get("models", {
-        "triage": "athena-triage", "deep": "athena", "reason": "athena-reason"
-    })
-    ext_cfg = athena_cfg.get("external_probes", {"enabled": False, "providers": []})
-    auto_triggers = set(ext_cfg.get("auto_trigger", ["BLOCK", "model-disagreement"]))
-
-    # Read evidence file if provided
-    evidence = ""
-    if evidence_file:
-        try:
-            evidence = f"\n\nEVIDENCE FILE ({evidence_file}):\n" + \
-                       pathlib.Path(evidence_file).read_text()[:3000]
-        except Exception as e:
-            evidence = f"\n\nEVIDENCE FILE ERROR: {e}"
-
-    print(f"\n[Athena] Review {action_id} | from: {from_agent}")
-    print(f"  Action: {action_text[:72]}{'...' if len(action_text)>72 else ''}")
-
-    # Standing approval check
-    domain = domain_hint or "routine"
-    if is_standing_approved(sovereign, profile, action_text, domain):
-        item = _make_item(action_id, now, from_agent, action_text, context, domain,
-                         "approved-standing", "SAFE", [], None, None, None)
-        log_event(sovereign, {"event": "standing-approved", "action_id": action_id})
-        print("  ✓ Standing approval — skipping Athena review")
-        return item
-
-    per_model_findings = []
+    print(f"\n[Athena] Starting review {action_id}")
+    print(f"  From:    {from_agent}")
+    print(f"  Action:  {action_text[:80]}{'...' if len(action_text) > 80 else ''}")
 
     # ── Stage 1: Triage ───────────────────────────────────────────────────────
-    print(f"  [1/3] {models['triage']}...", end=" ", flush=True)
-    triage_prompt = (
-        f"Proposed action from {from_agent}:\n\n"
-        f"ACTION: {action_text}\n\nCONTEXT: {context}"
-        + (f"\nDOMAIN HINT: {domain_hint}" if domain_hint else "")
-        + evidence
-    )
-    triage_raw = call_ollama(models["triage"], triage_prompt, timeout=30)
+    print(f"  [1/3] Triage ({MODELS['triage']})...", end=" ", flush=True)
+    triage_prompt = f"""Proposed action from {from_agent}:
+
+ACTION: {action_text}
+
+CONTEXT: {context}
+{f'DOMAIN HINT: {domain_hint}' if domain_hint else ''}
+
+Classify this action."""
+
+    triage_raw = call_ollama(MODELS["triage"], triage_prompt, timeout=30)
     triage = parse_triage(triage_raw)
     domain = domain_hint or triage["domain"]
-    triage["model"] = models["triage"]
-    per_model_findings.append({"stage": "triage", **triage})
     print(f"→ {triage['triage']} / {domain}")
 
-    log_event(sovereign, {"event": "triage", "action_id": action_id,
-                          "triage": triage["triage"], "domain": domain, "flag": triage["flag"]})
+    log_event({
+        "event": "triage",
+        "action_id": action_id,
+        "from": from_agent,
+        "triage": triage["triage"],
+        "domain": domain,
+        "flag": triage["flag"],
+    })
 
+    # BLOCK at triage — no further review needed
     if triage["triage"] == "BLOCK":
-        item = _make_item(action_id, now, from_agent, action_text, context, domain,
-                         "blocked", "BLOCK", per_model_findings, None, None, None)
-        log_event(sovereign, {"event": "blocked-at-triage", "action_id": action_id})
-        print(f"  ⛔ BLOCKED at triage")
+        item = {
+            "id": action_id,
+            "created": now,
+            "from": from_agent,
+            "action": action_text,
+            "context": context,
+            "domain": domain,
+            "status": "blocked",
+            "triage": triage,
+            "deep_review": None,
+            "reason_review": None,
+            "bill_audit": None,
+        }
+        log_event({"event": "blocked-at-triage", "action_id": action_id, "flag": triage["flag"]})
+        print(f"  ⛔ BLOCKED at triage: {triage['flag']}")
         return item
 
+    # PASS at triage — skip deep review for truly routine items
     if triage["triage"] == "PASS" and domain == "routine":
-        item = _make_item(action_id, now, from_agent, action_text, context, domain,
-                         "approved-routine", "SAFE", per_model_findings, None, None, None)
-        log_event(sovereign, {"event": "approved-routine", "action_id": action_id})
-        print(f"  ✓ Approved (routine)")
+        item = {
+            "id": action_id,
+            "created": now,
+            "from": from_agent,
+            "action": action_text,
+            "context": context,
+            "domain": domain,
+            "status": "approved-routine",
+            "triage": triage,
+            "deep_review": None,
+            "reason_review": None,
+            "bill_audit": None,
+        }
+        log_event({"event": "approved-routine", "action_id": action_id})
+        print(f"  ✓ Approved (routine, no deep review needed)")
         return item
 
     # ── Stage 2: Deep review ──────────────────────────────────────────────────
-    print(f"  [2/3] {models['deep']}...", end=" ", flush=True)
-    deep_prompt = (
-        f"Triage: {triage['triage']} / {domain} — {triage['flag']}\n\n"
-        f"Proposed action from {from_agent}:\nACTION: {action_text}\nCONTEXT: {context}"
-        + evidence
-    )
-    deep_raw = call_ollama(models["deep"], deep_prompt, timeout=120)
-    deep = parse_deep(deep_raw, models["deep"])
-    per_model_findings.append({"stage": "deep", **deep})
+    print(f"  [2/3] Deep review ({MODELS['deep']})...", end=" ", flush=True)
+    deep_prompt = f"""Triage result: {triage['triage']} / domain: {domain}
+Triage flag: {triage['flag']}
+
+Proposed action from {from_agent}:
+ACTION: {action_text}
+CONTEXT: {context}
+
+Perform your full security review."""
+
+    deep_raw = call_ollama(MODELS["deep"], deep_prompt, timeout=120)
+    deep = parse_deep(deep_raw)
     print(f"→ {deep['risk']} / {deep['recommendation']}")
 
-    log_event(sovereign, {"event": "deep-review", "action_id": action_id,
-                          "risk": deep["risk"], "recommendation": deep["recommendation"]})
+    log_event({
+        "event": "deep-review",
+        "action_id": action_id,
+        "risk": deep["risk"],
+        "recommendation": deep["recommendation"],
+    })
 
-    # ── Stage 3: Reason ───────────────────────────────────────────────────────
+    # ── Stage 3: Reason (for high-risk domains) ───────────────────────────────
     reason = None
-    needs_reason = (domain in REASON_DOMAINS or triage["triage"] == "REASON"
-                    or deep["risk"] in ("ESCALATE", "BLOCK"))
-    if needs_reason:
-        print(f"  [3/3] {models['reason']}...", end=" ", flush=True)
-        reason_prompt = (
-            f"Deep review: {deep['risk']} — {deep['recommendation']}\n\n"
-            f"ACTION: {action_text}\nCONTEXT: {context}\nDOMAIN: {domain}\n\n"
-            f"Prior finding summary: {deep_raw[:400]}" + evidence
-        )
-        reason_raw = call_ollama(models["reason"], reason_prompt, timeout=180)
-        reason = parse_deep(reason_raw, models["reason"])
-        per_model_findings.append({"stage": "reason", **reason})
+    if domain in REASON_DOMAINS or triage["triage"] == "REASON" or deep["risk"] in ("ESCALATE", "BLOCK"):
+        print(f"  [3/3] Threat modeling ({MODELS['reason']})...", end=" ", flush=True)
+        reason_prompt = f"""Deep review result: {deep['risk']} — {deep['recommendation']}
+
+Proposed action from {from_agent}:
+ACTION: {action_text}
+CONTEXT: {context}
+DOMAIN: {domain}
+
+Previous finding: {deep['full_text'][:500]}
+
+Perform adversarial threat modeling."""
+
+        reason_raw = call_ollama(MODELS["reason"], reason_prompt, timeout=180)
+        reason = parse_deep(reason_raw)
+        reason["full_text"] = reason_raw
         print(f"→ {reason['risk']} / {reason['recommendation']}")
-        log_event(sovereign, {"event": "reason-review", "action_id": action_id,
-                              "risk": reason["risk"], "recommendation": reason["recommendation"]})
+
+        log_event({
+            "event": "reason-review",
+            "action_id": action_id,
+            "risk": reason["risk"],
+            "recommendation": reason["recommendation"],
+        })
     else:
         print(f"  [3/3] Threat modeling — skipped (domain: {domain})")
 
-    # ── External probes ───────────────────────────────────────────────────────
-    external_findings = []
-    all_risks = [f["risk"] for f in per_model_findings if "risk" in f]
-    final_risk_so_far = worst_risk(all_risks) if all_risks else "SAFE"
-
-    should_probe = (
-        ext_cfg.get("enabled") and (
-            ("BLOCK" in auto_triggers and final_risk_so_far == "BLOCK") or
-            ("model-disagreement" in auto_triggers and reason and
-             models_disagree(deep["risk"], reason["risk"])) or
-            ("probe-requested" in auto_triggers and
-             any(f.get("probe_requested") for f in per_model_findings))
-        )
-    )
-
-    if should_probe:
-        for provider in ext_cfg.get("providers", []):
-            if not provider.get("enabled"):
-                continue
-            print(f"  [probe] {provider['label']}...", end=" ", flush=True)
-            probe_prompt = (
-                f"Security review request. You are an adversarial reviewer.\n\n"
-                f"ACTION: {action_text}\nCONTEXT: {context}\nDOMAIN: {domain}\n\n"
-                f"Local model findings:\n"
-                + "\n".join(f"- {f['stage']}: {f.get('risk','?')} / {f.get('recommendation','')}\n  "
-                            f"{f.get('flag', f.get('conditions',''))}" for f in per_model_findings)
-                + "\n\nPlease provide your independent assessment. Be adversarial. Find what the local models may have missed."
-            )
-            probe_result = call_external(provider, probe_prompt)
-            probe_parsed = parse_deep(probe_result, provider["label"])
-            probe_parsed["stage"] = f"external:{provider['id']}"
-            per_model_findings.append(probe_parsed)
-            external_findings.append(probe_parsed)
-            print(f"→ {probe_parsed['risk']}")
-            log_event(sovereign, {"event": "external-probe", "action_id": action_id,
-                                  "provider": provider["id"], "risk": probe_parsed["risk"]})
-
     # ── Final verdict ─────────────────────────────────────────────────────────
-    all_risks = [f["risk"] for f in per_model_findings if "risk" in f]
-    final_risk = worst_risk(all_risks) if all_risks else "CAUTION"
-    disagreement = (reason is not None and models_disagree(deep["risk"], reason["risk"]))
+    # Worst risk wins
+    risks = ["SAFE", "CAUTION", "ESCALATE", "BLOCK"]
+    all_risks = [deep["risk"]]
+    if reason:
+        all_risks.append(reason["risk"])
+    final_risk = max(all_risks, key=lambda r: risks.index(r) if r in risks else 0)
 
+    # Status based on final risk
     if final_risk == "BLOCK":
         status = "blocked"
-    elif final_risk in ("ESCALATE",) or disagreement:
-        status = "pending-audit"
+    elif final_risk in ("ESCALATE",) or (reason and reason["recommendation"] == "escalate-to-bill"):
+        status = "pending-audit"   # requires Bill's explicit approval
     elif final_risk == "CAUTION":
-        status = "pending-audit"
+        status = "pending-audit"   # surfaced to Bill at next harvest
     else:
-        status = "approved"
+        status = "approved"        # SAFE across all models
 
-    item = _make_item(action_id, now, from_agent, action_text, context, domain,
-                     status, final_risk, per_model_findings,
-                     disagreement, external_findings or None, None)
-
-    log_event(sovereign, {"event": "review-complete", "action_id": action_id,
-                          "final_risk": final_risk, "status": status,
-                          "model_count": len(per_model_findings),
-                          "disagreement": disagreement})
-
-    icons = {"blocked": "⛔", "pending-audit": "⚠️ ", "approved": "✓"}
-    print(f"  {icons.get(status,'?')} {final_risk} → {status}"
-          + (" [MODELS DISAGREE]" if disagreement else ""))
-    return item
-
-
-def _make_item(action_id, now, from_agent, action_text, context, domain,
-              status, final_risk, per_model_findings,
-              disagreement, external_findings, bill_audit) -> dict:
-    return {
+    item = {
         "id": action_id,
         "created": now,
         "from": from_agent,
@@ -368,35 +275,65 @@ def _make_item(action_id, now, from_agent, action_text, context, domain,
         "domain": domain,
         "status": status,
         "final_risk": final_risk,
-        "model_findings": per_model_findings,   # per-model, listed separately
-        "models_disagree": bool(disagreement),
-        "external_findings": external_findings,
-        "bill_audit": bill_audit,
+        "triage": triage,
+        "deep_review": {
+            "risk": deep["risk"],
+            "recommendation": deep["recommendation"],
+            "summary": deep["full_text"][:1000],
+        },
+        "reason_review": {
+            "risk": reason["risk"],
+            "recommendation": reason["recommendation"],
+            "summary": reason["full_text"][:1000],
+        } if reason else None,
+        "bill_audit": None,
     }
+
+    log_event({
+        "event": "review-complete",
+        "action_id": action_id,
+        "final_risk": final_risk,
+        "status": status,
+    })
+
+    status_icon = {"blocked": "⛔", "pending-audit": "⚠️ ", "approved": "✓"}.get(status, "?")
+    print(f"  {status_icon} Final: {final_risk} → {status}")
+    return item
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def cmd_propose(args, sovereign):
-    profile = load_profile(sovereign)
+def cmd_propose(args):
+    context = args.context
+    if args.review_file:
+        file_path = pathlib.Path(args.review_file)
+        if not file_path.exists():
+            print(f"ERROR: --file path not found: {file_path}")
+            sys.exit(1)
+        try:
+            file_content = file_path.read_text(encoding="utf-8", errors="replace")
+            # Limit to 8000 chars to stay within model context windows
+            if len(file_content) > 8000:
+                file_content = file_content[:8000] + "\n... [truncated]"
+            context = context + f"\n\nFILE: {file_path.name}\n---\n{file_content}\n---"
+        except OSError as e:
+            print(f"ERROR: Could not read --file: {e}")
+            sys.exit(1)
     item = review(
-        sovereign=sovereign,
-        profile=profile,
         from_agent=args.from_agent,
         action_text=args.action,
-        context=args.context,
+        context=context,
         domain_hint=args.domain,
-        evidence_file=args.file,
     )
-    if item["status"] not in ("approved-routine", "approved-standing"):
-        queue = load_queue(sovereign)
-        queue["actions"].append(item)
-        save_queue(sovereign, queue)
-        print(f"  Queued: {item['id']} (status: {item['status']})")
+    if item["status"] not in ("approved-routine",):
+        add_to_queue(item)
+        print(f"\n  Queued as {item['id']} (status: {item['status']})")
+    else:
+        print(f"\n  Routine action logged only (not queued)")
 
 
-def cmd_status(args, sovereign):
-    queue = load_queue(sovereign)
+def cmd_status(args):
+    queue = load_queue()
     actions = queue.get("actions", [])
     by_status = {}
     for a in actions:
@@ -407,42 +344,46 @@ def cmd_status(args, sovereign):
         print(f"  {s}: {count}")
 
 
-def cmd_pending(args, sovereign):
-    queue = load_queue(sovereign)
+def cmd_pending(args):
+    queue = load_queue()
     pending = [a for a in queue.get("actions", []) if a.get("status") == "pending-audit"]
     if not pending:
-        print("\nNo items pending audit.")
+        print("\nNo items pending Bill's audit.")
         return
-    print(f"\n{len(pending)} pending:\n")
+    print(f"\n{len(pending)} item(s) pending audit:\n")
     for a in pending:
-        risk = a.get("final_risk", "?")
-        disagree = " [DISAGREE]" if a.get("models_disagree") else ""
-        print(f"  [{a['id']}] {a['created'][:10]} | {risk}{disagree} | {a['action'][:60]}")
+        created = a.get("created", "?")[:10]
+        risk = a.get("final_risk", a.get("triage", {}).get("triage", "?"))
+        print(f"  [{a['id']}] {created} | {risk} | {a['from']} → {a['action'][:60]}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Athena review pipeline")
-    parser.add_argument("--home", help="Sovereign home directory")
     sub = parser.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("propose")
-    p.add_argument("--from", dest="from_agent", default="allie")
-    p.add_argument("--action", required=True)
-    p.add_argument("--context", default="")
+    p = sub.add_parser("propose", help="Submit a proposed action for review")
+    p.add_argument("--from", dest="from_agent", default="allie", help="Proposing agent")
+    p.add_argument("--action", required=True, help="Description of the proposed action")
+    p.add_argument("--context", default="", help="Why this action is being proposed")
     p.add_argument("--domain", default=None,
-                   choices=["routine", "data", "privacy", "security", "code", "infrastructure"])
-    p.add_argument("--file", default=None, help="Path to evidence file Athena should read")
+                   choices=["routine", "data", "privacy", "security", "code", "infrastructure"],
+                   help="Force a specific domain (overrides triage classification)")
+    p.add_argument("--file", dest="review_file", default=None,
+                   help="Path to a file for Athena to review (content appended to context)")
 
-    sub.add_parser("status")
-    sub.add_parser("pending")
+    sub.add_parser("status", help="Show queue summary")
+    sub.add_parser("pending", help="List items awaiting Bill's audit")
 
     args = parser.parse_args()
     if not args.cmd:
         parser.print_help()
         sys.exit(0)
 
-    sovereign = get_sovereign_home(args.home)
-    {"propose": cmd_propose, "status": cmd_status, "pending": cmd_pending}[args.cmd](args, sovereign)
+    if not (ALLIE / "config").exists():
+        print(f"ERROR: {ALLIE}/config not found. Is the Allie drive mounted?")
+        sys.exit(1)
+
+    {"propose": cmd_propose, "status": cmd_status, "pending": cmd_pending}[args.cmd](args)
 
 
 if __name__ == "__main__":
